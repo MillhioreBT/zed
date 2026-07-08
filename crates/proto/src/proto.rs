@@ -382,6 +382,7 @@ messages!(
     (KillKernel, Background),
     (GetRemoteProfilingData, Background),
     (GetRemoteProfilingDataResponse, Background),
+    (WriteProjectEntryChunk, Background),
 );
 
 request_messages!(
@@ -398,6 +399,7 @@ request_messages!(
     (CopyProjectEntry, ProjectEntryResponse),
     (CreateChannel, CreateChannelResponse),
     (CreateProjectEntry, ProjectEntryResponse),
+    (WriteProjectEntryChunk, ProjectEntryResponse),
     (CreateRoom, CreateRoomResponse),
     (DeclineCall, Ack),
     (DeleteChannel, Ack),
@@ -636,6 +638,7 @@ entity_messages!(
     CreateFileForPeer,
     CreateImageForPeer,
     CreateProjectEntry,
+    WriteProjectEntryChunk,
     GetDocumentColor,
     GetDocumentLinks,
     ResolveDocumentLink,

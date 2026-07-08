@@ -50,9 +50,15 @@ use std::{
     rc::Rc,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 use unindent::Unindent as _;
-use util::{path, path_list::PathList, paths::PathMatcher, rel_path::rel_path};
+use util::{
+    path,
+    path_list::PathList,
+    paths::PathMatcher,
+    rel_path::{RelPath, rel_path},
+};
 
 #[gpui::test]
 async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
@@ -2072,6 +2078,7 @@ async fn test_copy_file_into_remote_project(
                     Path::new(path!("/local-code/dir1/dir2")).into(),
                 ],
                 local_fs.clone(),
+                None,
                 cx,
             )
         })
@@ -2116,6 +2123,166 @@ async fn test_copy_file_into_remote_project(
             .await
             .unwrap(),
         ""
+    );
+}
+
+#[gpui::test]
+async fn test_copy_large_file_into_remote_project(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(
+            path!("/code"),
+            json!({
+                "project1": {
+                    ".git": {},
+                    "README.md": "# project 1",
+                },
+            }),
+        )
+        .await;
+
+    let (project, _) = init_test(&remote_fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let local_fs = project
+        .read_with(cx, |project, _| project.fs().clone())
+        .as_fake();
+
+    // Larger than the 256 KiB chunk size used by `RemoteWorktree::copy_external_entries`,
+    // so this exercises the chunked `WriteProjectEntryChunk` path instead of a single
+    // `CreateProjectEntry`.
+    let large_content = "a".repeat(300 * 1024);
+    local_fs
+        .insert_tree(
+            path!("/local-code"),
+            json!({
+                "big_file": large_content.clone(),
+            }),
+        )
+        .await;
+
+    worktree
+        .update(cx, |worktree, cx| {
+            worktree.copy_external_entries(
+                RelPath::empty_arc(),
+                vec![Path::new(path!("/local-code/big_file")).into()],
+                local_fs.clone(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        remote_fs
+            .load(path!("/code/project1/big_file").as_ref())
+            .await
+            .unwrap(),
+        large_content
+    );
+
+    // No leftover temp file from the chunked upload.
+    assert!(
+        remote_fs
+            .paths(true)
+            .into_iter()
+            .all(|path| !path.to_string_lossy().contains(".zed-upload-")),
+        "chunked upload left a temp file behind: {:?}",
+        remote_fs.paths(true)
+    );
+}
+
+#[gpui::test]
+async fn test_cancel_large_file_upload_cleans_up_temp_file(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(
+            path!("/code"),
+            json!({
+                "project1": {
+                    ".git": {},
+                    "README.md": "# project 1",
+                },
+            }),
+        )
+        .await;
+
+    let (project, _) = init_test(&remote_fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let local_fs = project
+        .read_with(cx, |project, _| project.fs().clone())
+        .as_fake();
+
+    let large_content = "a".repeat(300 * 1024);
+    local_fs
+        .insert_tree(
+            path!("/local-code"),
+            json!({
+                "big_file": large_content,
+            }),
+        )
+        .await;
+
+    let task = worktree.update(cx, |worktree, cx| {
+        worktree.copy_external_entries(
+            RelPath::empty_arc(),
+            vec![Path::new(path!("/local-code/big_file")).into()],
+            local_fs.clone(),
+            None,
+            cx,
+        )
+    });
+
+    // Let at least the first chunk go out (and, ideally, back) before
+    // abandoning the upload partway through — dropping the task cancels the
+    // client's send loop the same way clicking "Cancel" on the upload toast
+    // does. Whatever the server managed to write is left as a
+    // `.zed-upload-*.tmp` file until its watchdog reaps it.
+    cx.run_until_parked();
+    drop(task);
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    server_cx.executor().advance_clock(Duration::from_secs(61));
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    assert!(
+        remote_fs
+            .paths(true)
+            .into_iter()
+            .all(|path| !path.to_string_lossy().contains(".zed-upload-")),
+        "abandoned upload's temp file was not cleaned up: {:?}",
+        remote_fs.paths(true)
+    );
+    assert!(
+        remote_fs
+            .load(path!("/code/project1/big_file").as_ref())
+            .await
+            .is_err(),
+        "canceled upload should not have produced a final file"
     );
 }
 

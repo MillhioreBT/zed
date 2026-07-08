@@ -57,6 +57,7 @@ use std::{
     ffi::OsStr,
     fmt,
     future::Future,
+    io::Read as _,
     mem::{self},
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -103,6 +104,18 @@ pub enum CreatedEntry {
     Included(Entry),
     /// Got created, but not indexed due to falling under exclusion filters.
     Excluded { abs_path: PathBuf },
+}
+
+/// Progress of a `copy_external_entries` upload to a remote worktree, reported
+/// so callers (e.g. the project panel) can show a live indicator instead of a
+/// silent, uncancelable operation.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalCopyProgress {
+    pub bytes_copied: u64,
+    pub total_bytes: u64,
+    pub files_copied: usize,
+    pub total_files: usize,
+    pub current_path: Option<Arc<Path>>,
 }
 
 #[derive(Debug)]
@@ -957,6 +970,60 @@ impl Worktree {
         }
     }
 
+    /// Writes one chunk of an incrementally-uploaded file. See
+    /// `LocalWorktree::write_entry_chunk` and `RemoteWorktree::copy_external_entries`.
+    pub fn write_entry_chunk(
+        &mut self,
+        path: Arc<RelPath>,
+        upload_id: u64,
+        offset: u64,
+        content: Vec<u8>,
+        last: bool,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<Option<CreatedEntry>>> {
+        let worktree_id = self.id();
+        match self {
+            Worktree::Local(this) => {
+                this.write_entry_chunk(path, upload_id, offset, content, last, cx)
+            }
+            Worktree::Remote(this) => {
+                let project_id = this.project_id;
+                let request = this.client.request(proto::WriteProjectEntryChunk {
+                    worktree_id: worktree_id.to_proto(),
+                    project_id,
+                    path: path.as_ref().to_proto(),
+                    upload_id,
+                    offset,
+                    content,
+                    last,
+                });
+                cx.spawn(async move |this, cx| {
+                    let response = request.await?;
+                    if !last {
+                        return Ok(None);
+                    }
+                    match response.entry {
+                        Some(entry) => this
+                            .update(cx, |worktree, cx| {
+                                worktree.as_remote_mut().unwrap().insert_entry(
+                                    entry,
+                                    response.worktree_scan_id as usize,
+                                    cx,
+                                )
+                            })?
+                            .await
+                            .map(|entry| Some(CreatedEntry::Included(entry))),
+                        None => {
+                            let abs_path =
+                                this.read_with(cx, |worktree, _| worktree.absolutize(&path))?;
+                            Ok(Some(CreatedEntry::Excluded { abs_path }))
+                        }
+                    }
+                })
+            }
+        }
+    }
+
     pub fn delete_entry(
         &mut self,
         entry_id: ProjectEntryId,
@@ -1023,11 +1090,14 @@ impl Worktree {
         target_directory: Arc<RelPath>,
         paths: Vec<Arc<Path>>,
         fs: Arc<dyn Fs>,
+        progress: Option<watch::Sender<ExternalCopyProgress>>,
         cx: &Context<Worktree>,
     ) -> Task<Result<Vec<ProjectEntryId>>> {
         match self {
             Worktree::Local(this) => this.copy_external_entries(target_directory, paths, cx),
-            Worktree::Remote(this) => this.copy_external_entries(target_directory, paths, fs, cx),
+            Worktree::Remote(this) => {
+                this.copy_external_entries(target_directory, paths, fs, progress, cx)
+            }
         }
     }
 
@@ -1105,6 +1175,35 @@ impl Worktree {
             entry: match &entry.await? {
                 CreatedEntry::Included(entry) => Some(entry.into()),
                 CreatedEntry::Excluded { .. } => None,
+            },
+            worktree_scan_id: scan_id as u64,
+        })
+    }
+
+    pub async fn handle_write_entry_chunk(
+        this: Entity<Self>,
+        request: proto::WriteProjectEntryChunk,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ProjectEntryResponse> {
+        let (scan_id, entry) = this.update(&mut cx, |this, cx| {
+            anyhow::Ok((
+                this.scan_id(),
+                this.write_entry_chunk(
+                    RelPath::from_proto(&request.path).with_context(|| {
+                        format!("received invalid relative path {:?}", request.path)
+                    })?,
+                    request.upload_id,
+                    request.offset,
+                    request.content,
+                    request.last,
+                    cx,
+                ),
+            ))
+        })?;
+        Ok(proto::ProjectEntryResponse {
+            entry: match entry.await? {
+                Some(CreatedEntry::Included(entry)) => Some((&entry).into()),
+                Some(CreatedEntry::Excluded { .. }) | None => None,
             },
             worktree_scan_id: scan_id as u64,
         })
@@ -1711,6 +1810,141 @@ impl LocalWorktree {
                 .await?
                 .map(CreatedEntry::Included)
                 .unwrap_or_else(|| CreatedEntry::Excluded { abs_path }))
+        })
+    }
+
+    /// Writes one chunk of a file being uploaded incrementally (see
+    /// `RemoteWorktree::copy_external_entries`). Chunks are written to a
+    /// sibling temp file so that a partially-uploaded file never appears
+    /// under its real name; on the last chunk the temp file is renamed into
+    /// place and the entry is created/refreshed just like `create_entry`.
+    /// Writes are offset-addressed so replaying an unacked chunk after a
+    /// reconnect is a no-op rather than corrupting the file.
+    pub fn write_entry_chunk(
+        &self,
+        path: Arc<RelPath>,
+        upload_id: u64,
+        offset: u64,
+        content: Vec<u8>,
+        last: bool,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<Option<CreatedEntry>>> {
+        let abs_path = self.absolutize(&path);
+        let path_excluded = self.settings.is_path_excluded(&path);
+        let fs = self.fs.clone();
+        let Some(parent) = abs_path.parent() else {
+            return Task::ready(Err(anyhow!("cannot upload to {abs_path:?}: no parent")));
+        };
+        let tmp_path = parent.join(format!(".zed-upload-{upload_id}.tmp"));
+
+        // Guard against abandoned uploads (e.g. the client disconnects and never
+        // sends a `last` chunk): if nothing writes to the temp file again within
+        // this window, delete it. Each chunk spawns its own watchdog, so only the
+        // watchdog for the most recent chunk ever finds the file actually stale;
+        // earlier ones see a newer mtime and no-op.
+        const UPLOAD_STALE_TIMEOUT: Duration = Duration::from_secs(60);
+        if !last {
+            let executor = cx.background_executor().clone();
+            let watchdog_fs = fs.clone();
+            let watchdog_path = tmp_path.clone();
+            executor
+                .clone()
+                .spawn(async move {
+                    executor.timer(UPLOAD_STALE_TIMEOUT).await;
+                    if let Ok(Some(metadata)) = watchdog_fs.metadata(&watchdog_path).await
+                        && metadata
+                            .mtime
+                            .timestamp_for_user()
+                            .elapsed()
+                            .unwrap_or_default()
+                            >= UPLOAD_STALE_TIMEOUT
+                    {
+                        watchdog_fs
+                            .remove_file(
+                                &watchdog_path,
+                                fs::RemoveOptions {
+                                    recursive: false,
+                                    ignore_if_not_exists: true,
+                                },
+                            )
+                            .await
+                            .ok();
+                    }
+                })
+                .detach();
+        }
+
+        let task_abs_path = abs_path.clone();
+        let write = cx.background_spawn(async move {
+            if offset == 0 {
+                fs.write(&tmp_path, &content)
+                    .await
+                    .with_context(|| format!("uploading to {task_abs_path:?}"))?;
+            } else {
+                fs.write_at(&tmp_path, offset, &content)
+                    .await
+                    .with_context(|| format!("uploading to {task_abs_path:?}"))?;
+            }
+            if last {
+                fs.rename(
+                    &tmp_path,
+                    &task_abs_path,
+                    fs::RenameOptions {
+                        overwrite: true,
+                        ignore_if_exists: false,
+                        create_parents: true,
+                    },
+                )
+                .await
+                .with_context(|| format!("finishing upload to {task_abs_path:?}"))?;
+            }
+            anyhow::Ok(())
+        });
+
+        if !last {
+            return cx.background_spawn(async move {
+                write.await?;
+                Ok(None)
+            });
+        }
+
+        let lowest_ancestor = self.lowest_ancestor(&path);
+        cx.spawn(async move |this, cx| {
+            write.await?;
+            if path_excluded {
+                return Ok(Some(CreatedEntry::Excluded { abs_path }));
+            }
+
+            let (result, refreshes) = this.update(cx, |this, cx| {
+                let mut refreshes = Vec::new();
+                let refresh_paths = path.strip_prefix(&lowest_ancestor).unwrap();
+                for refresh_path in refresh_paths.ancestors() {
+                    if refresh_path == RelPath::empty() {
+                        continue;
+                    }
+                    let refresh_full_path = lowest_ancestor.join(refresh_path);
+
+                    refreshes.push(this.as_local_mut().unwrap().refresh_entry(
+                        refresh_full_path,
+                        None,
+                        cx,
+                    ));
+                }
+                (
+                    this.as_local_mut().unwrap().refresh_entry(path, None, cx),
+                    refreshes,
+                )
+            })?;
+            for refresh in refreshes {
+                refresh.await.log_err();
+            }
+
+            Ok(Some(
+                result
+                    .await?
+                    .map(CreatedEntry::Included)
+                    .unwrap_or_else(|| CreatedEntry::Excluded { abs_path }),
+            ))
         })
     }
 
@@ -2357,14 +2591,33 @@ impl RemoteWorktree {
         target_directory: Arc<RelPath>,
         paths_to_copy: Vec<Arc<Path>>,
         local_fs: Arc<dyn Fs>,
+        mut progress: Option<watch::Sender<ExternalCopyProgress>>,
         cx: &Context<Worktree>,
     ) -> Task<anyhow::Result<Vec<ProjectEntryId>>> {
+        // Large files are streamed to the remote host in bounded chunks
+        // (`WriteProjectEntryChunk`) rather than as a single unbounded RPC
+        // message, so that a slow link doesn't hold the whole file in memory,
+        // starve the connection's heartbeat, or block every other message
+        // sharing this connection. Collab guests don't get chunking: their
+        // messages are relayed through the collab server, which doesn't know
+        // this project's `WriteProjectEntryChunk` handler exists on the far
+        // end, so they keep using the original single-message path.
+        const CHUNK_SIZE: usize = 256 * 1024;
+
         let client = self.client.clone();
         let worktree_id = self.id().to_proto();
         let project_id = self.project_id;
+        let use_chunking = !client.is_via_collab();
 
         cx.background_spawn(async move {
-            let mut requests = Vec::new();
+            struct PlannedEntry {
+                target_path: Arc<RelPath>,
+                abs_path: PathBuf,
+                is_directory: bool,
+                size: u64,
+            }
+
+            let mut planned = Vec::new();
             for root_path_to_copy in paths_to_copy {
                 let Some(filename) = root_path_to_copy
                     .file_name()
@@ -2384,10 +2637,15 @@ impl RemoteWorktree {
                     else {
                         continue;
                     };
-                    let content = if is_directory {
-                        None
+
+                    let size = if is_directory {
+                        0
                     } else {
-                        Some(local_fs.load_bytes(&abs_path).await?)
+                        local_fs
+                            .metadata(&abs_path)
+                            .await?
+                            .map(|metadata| metadata.len)
+                            .unwrap_or(0)
                     };
 
                     let mut target_path = target_directory.join(filename);
@@ -2395,22 +2653,118 @@ impl RemoteWorktree {
                         target_path = target_path.join(&relative_path);
                     }
 
-                    requests.push(proto::CreateProjectEntry {
-                        project_id,
-                        worktree_id,
-                        path: target_path.to_proto(),
+                    planned.push(PlannedEntry {
+                        target_path,
+                        abs_path,
                         is_directory,
-                        content,
+                        size,
                     });
                 }
             }
-            requests.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-            requests.dedup();
+            planned.sort_unstable_by(|a, b| a.target_path.cmp(&b.target_path));
+            planned.dedup_by(|a, b| {
+                a.target_path == b.target_path
+                    && a.abs_path == b.abs_path
+                    && a.is_directory == b.is_directory
+            });
+
+            let mut total = ExternalCopyProgress {
+                total_files: planned.iter().filter(|entry| !entry.is_directory).count(),
+                total_bytes: planned.iter().map(|entry| entry.size).sum(),
+                ..Default::default()
+            };
+            if let Some(progress) = &mut progress {
+                progress.send(total.clone()).await.ok();
+            }
 
             let mut copied_entry_ids = Vec::new();
-            for request in requests {
-                let response = client.request(request).await?;
-                copied_entry_ids.extend(response.entry.map(|e| ProjectEntryId::from_proto(e.id)));
+            for entry in planned {
+                if let Some(progress) = &mut progress {
+                    total.current_path = Some(Arc::from(entry.abs_path.as_path()));
+                    progress.send(total.clone()).await.ok();
+                }
+
+                if entry.is_directory {
+                    let response = client
+                        .request(proto::CreateProjectEntry {
+                            project_id,
+                            worktree_id,
+                            path: entry.target_path.to_proto(),
+                            is_directory: true,
+                            content: None,
+                        })
+                        .await?;
+                    copied_entry_ids
+                        .extend(response.entry.map(|e| ProjectEntryId::from_proto(e.id)));
+                    continue;
+                }
+
+                if !use_chunking || entry.size as usize <= CHUNK_SIZE {
+                    let content = local_fs.load_bytes(&entry.abs_path).await?;
+                    let response = client
+                        .request(proto::CreateProjectEntry {
+                            project_id,
+                            worktree_id,
+                            path: entry.target_path.to_proto(),
+                            is_directory: false,
+                            content: Some(content),
+                        })
+                        .await?;
+                    copied_entry_ids
+                        .extend(response.entry.map(|e| ProjectEntryId::from_proto(e.id)));
+                } else {
+                    let upload_id = rand::random::<u64>();
+                    let mut reader = local_fs.open_sync(&entry.abs_path).await?;
+                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                    let mut offset = 0u64;
+                    let mut response = None;
+                    loop {
+                        // `Read::read` may return fewer bytes than requested
+                        // without having hit EOF, so fill the buffer in a loop
+                        // and only treat a 0-byte read as end of file.
+                        let mut filled = 0;
+                        while filled < buffer.len() {
+                            let read = reader.read(&mut buffer[filled..])?;
+                            if read == 0 {
+                                break;
+                            }
+                            filled += read;
+                        }
+                        // An empty file, or a file whose size changed since we
+                        // measured it, still needs at least one (possibly
+                        // empty) chunk sent so the server creates the entry.
+                        let is_last = filled < buffer.len();
+                        let chunk_response = client
+                            .request(proto::WriteProjectEntryChunk {
+                                project_id,
+                                worktree_id,
+                                path: entry.target_path.to_proto(),
+                                upload_id,
+                                offset,
+                                content: buffer[..filled].to_vec(),
+                                last: is_last,
+                            })
+                            .await?;
+                        offset += filled as u64;
+                        if let Some(progress) = &mut progress {
+                            total.bytes_copied += filled as u64;
+                            progress.send(total.clone()).await.ok();
+                        }
+                        if is_last {
+                            response = Some(chunk_response);
+                            break;
+                        }
+                    }
+                    if let Some(response) = response {
+                        copied_entry_ids
+                            .extend(response.entry.map(|e| ProjectEntryId::from_proto(e.id)));
+                    }
+                }
+
+                if let Some(progress) = &mut progress {
+                    total.files_copied += 1;
+                    progress.send(total.clone()).await.ok();
+                }
             }
 
             Ok(copied_entry_ids)

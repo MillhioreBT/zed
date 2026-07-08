@@ -33,6 +33,7 @@ use language::DiagnosticSeverity;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::StatusToast;
+use postage::{prelude::Stream as _, watch};
 use project::{
     Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
     ProjectPath, Worktree, WorktreeId,
@@ -62,8 +63,9 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProgressBar,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -71,14 +73,15 @@ use util::{
     maybe,
     paths::{PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
+    size::format_file_size,
 };
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
-    SelectedEntry, SplitDirection, Workspace,
+    SelectedEntry, SplitDirection, ToastView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
 };
-use worktree::CreatedEntry;
+use worktree::{CreatedEntry, ExternalCopyProgress};
 use zed_actions::{
     project_panel::{Toggle, ToggleFocus},
     workspace::OpenWithSystem,
@@ -97,6 +100,126 @@ struct VisibleEntriesForWorktree {
     entries: Vec<GitEntry>,
     index: OnceCell<HashSet<Arc<RelPath>>>,
 }
+
+/// Shows live progress for a `drop_external_files` upload to a remote
+/// worktree, with a button to cancel it. Owns the upload's `Task`, so
+/// dropping that task (via Cancel, or when the toast itself is dropped
+/// before the upload finishes) cancels the copy and any in-flight chunk
+/// request. Auto-dismisses when the progress channel closes, which happens
+/// when the upload task (successfully or not) completes.
+struct UploadProgressToast {
+    latest: ExternalCopyProgress,
+    task: Option<Task<Option<()>>>,
+    focus_handle: FocusHandle,
+    _watch_task: Task<()>,
+}
+
+impl UploadProgressToast {
+    fn new(mut progress_rx: watch::Receiver<ExternalCopyProgress>, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let watch_task = cx.spawn(async move |this, cx| {
+            while let Some(progress) = progress_rx.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.latest = progress;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            // The sender was dropped, meaning the upload task finished
+            // (successfully or with an error); nothing left to show or cancel.
+            this.update(cx, |this, cx| {
+                this.task = None;
+                cx.emit(DismissEvent);
+            })
+            .ok();
+        });
+        Self {
+            latest: ExternalCopyProgress::default(),
+            task: None,
+            focus_handle,
+            _watch_task: watch_task,
+        }
+    }
+}
+
+impl Render for UploadProgressToast {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let progress = &self.latest;
+        let label = progress
+            .current_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Uploading…".to_string());
+        let detail = format!(
+            "{}/{} files · {} / {}",
+            progress.files_copied.min(progress.total_files),
+            progress.total_files,
+            format_file_size(progress.bytes_copied, true),
+            format_file_size(progress.total_bytes, true),
+        );
+
+        v_flex()
+            .id("upload-progress-toast")
+            .elevation_3(cx)
+            .gap_1()
+            .py_1p5()
+            .px_2p5()
+            .w(px(320.))
+            .bg(cx.theme().colors().surface_background)
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(Label::new(label).size(LabelSize::Small).truncate())
+                    .child(
+                        IconButton::new("cancel-upload", IconName::Close)
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Cancel Upload"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.task.take();
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
+            )
+            .child(ProgressBar::new(
+                "upload-progress-bar",
+                progress.bytes_copied as f32,
+                progress.total_bytes.max(1) as f32,
+                cx,
+            ))
+            .child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+    }
+}
+
+impl ToastView for UploadProgressToast {
+    fn action(&self) -> Option<workspace::ToastAction> {
+        None
+    }
+
+    fn auto_dismiss(&self) -> bool {
+        false
+    }
+}
+
+impl Focusable for UploadProgressToast {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for UploadProgressToast {}
 
 struct State {
     last_worktree_root_id: Option<ProjectEntryId>,
@@ -4608,7 +4731,18 @@ impl ProjectPanel {
             }
         }
 
-        cx.spawn_in(window, async move |this, cx| {
+        // Uploads to a remote worktree can be slow (large files, slow links), so
+        // they're reported through a progress channel instead of running silently;
+        // local copies are effectively instantaneous and don't need this.
+        let is_remote = !worktree.read(cx).is_local();
+        let (progress_tx, progress_rx) = if is_remote {
+            let (tx, rx) = watch::channel_with(ExternalCopyProgress::default());
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let task = cx.spawn_in(window, async move |this, cx| {
             async move {
                 for (filename, original_path) in &paths_to_replace {
                     let prompt_message = format!(
@@ -4645,7 +4779,7 @@ impl ProjectPanel {
                 let (worktree_id, task) = worktree.update(cx, |worktree, cx| {
                     (
                         worktree.id(),
-                        worktree.copy_external_entries(target_directory, paths, fs, cx),
+                        worktree.copy_external_entries(target_directory, paths, fs, progress_tx, cx),
                     )
                 });
 
@@ -4690,6 +4824,34 @@ impl ProjectPanel {
             }
             .log_err()
             .await
+        });
+
+        let Some(progress_rx) = progress_rx else {
+            task.detach();
+            return;
+        };
+
+        // `task` owns the whole upload; dropping it (via the toast's Cancel
+        // button) cancels the copy and any in-flight chunk request.
+        let toast = cx.new(|cx| UploadProgressToast::new(progress_rx, cx));
+        toast.update(cx, |toast, _| toast.task = Some(task));
+
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            // Avoid flashing a toast for drops that finish almost instantly.
+            cx.background_executor()
+                .timer(Duration::from_secs(1))
+                .await;
+            let still_running = toast
+                .read_with(cx, |toast, _| toast.task.is_some())
+                .unwrap_or(false);
+            if still_running {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_status_toast(toast.clone(), cx);
+                    })
+                    .ok();
+            }
         })
         .detach();
     }

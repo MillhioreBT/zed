@@ -214,6 +214,7 @@ impl EventEmitter<WorktreeStoreEvent> for WorktreeStore {}
 impl WorktreeStore {
     pub fn init(client: &AnyProtoClient) {
         client.add_entity_request_handler(Self::handle_create_project_entry);
+        client.add_entity_request_handler(Self::handle_write_project_entry_chunk);
         client.add_entity_request_handler(Self::handle_copy_project_entry);
         client.add_entity_request_handler(Self::handle_delete_project_entry);
         client.add_entity_request_handler(Self::handle_expand_project_entry);
@@ -1220,6 +1221,19 @@ impl WorktreeStore {
                 .context("worktree not found")
         })?;
         Worktree::handle_create_entry(worktree, envelope.payload, cx).await
+    }
+
+    pub async fn handle_write_project_entry_chunk(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::WriteProjectEntryChunk>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ProjectEntryResponse> {
+        let worktree = this.update(&mut cx, |this, cx| {
+            let worktree_id = WorktreeId::from_proto(envelope.payload.worktree_id);
+            this.worktree_for_id(worktree_id, cx)
+                .context("worktree not found")
+        })?;
+        Worktree::handle_write_entry_chunk(worktree, envelope.payload, cx).await
     }
 
     pub async fn handle_copy_project_entry(

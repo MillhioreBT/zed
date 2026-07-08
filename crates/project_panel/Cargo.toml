@@ -52,6 +52,7 @@ notifications.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 log.workspace = true
+postage.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }

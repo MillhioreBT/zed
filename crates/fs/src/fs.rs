@@ -135,6 +135,12 @@ pub trait Fs: Send + Sync {
     async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()>;
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()>;
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()>;
+    /// Writes `content` at the given byte `offset` within the file at `path`,
+    /// creating the file (and its parent directories) if it does not exist.
+    /// Unlike [`Fs::write`], this does not truncate any existing content
+    /// beyond the written range, so it can be called repeatedly with
+    /// increasing offsets to append a large file incrementally.
+    async fn write_at(&self, path: &Path, offset: u64, content: &[u8]) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf>;
     async fn is_file(&self, path: &Path) -> bool;
     async fn is_dir(&self, path: &Path) -> bool;
@@ -922,6 +928,29 @@ impl Fs for RealFs {
         self.executor
             .spawn(async move {
                 std::fs::write(path, contents)?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn write_at(&self, path: &Path, offset: u64, content: &[u8]) -> Result<()> {
+        if let Some(path) = path.parent() {
+            self.create_dir(path)
+                .await
+                .with_context(|| format!("Failed to create directory at {:?}", path))?;
+        }
+        let path = path.to_owned();
+        let content = content.to_owned();
+        self.executor
+            .spawn(async move {
+                use std::io::{Seek, SeekFrom};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&path)
+                    .with_context(|| format!("Failed to open file at {:?}", path))?;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&content)?;
                 Ok(())
             })
             .await
@@ -3029,6 +3058,29 @@ impl Fs for FakeFs {
             self.create_dir(path).await?;
         }
         self.write_file_internal(path, content.to_vec(), false)?;
+        Ok(())
+    }
+
+    async fn write_at(&self, path: &Path, offset: u64, content: &[u8]) -> Result<()> {
+        self.simulate_random_delay().await;
+        let path = normalize_path(path);
+        if let Some(path) = path.parent() {
+            self.create_dir(path).await?;
+        }
+        let mut existing = {
+            let mut state = self.state.lock();
+            match state.entry(&path) {
+                Ok(entry) => entry.file_content(&path).cloned().unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let offset = offset as usize;
+        let end = offset + content.len();
+        if existing.len() < end {
+            existing.resize(end, 0);
+        }
+        existing[offset..end].copy_from_slice(content);
+        self.write_file_internal(path, existing, false)?;
         Ok(())
     }
 
